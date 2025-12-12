@@ -2,3 +2,5 @@ trl
 transformers
 datasets
 math-verify
+numpy
+accelerate

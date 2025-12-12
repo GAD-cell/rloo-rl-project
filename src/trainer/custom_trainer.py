@@ -1,5 +1,12 @@
 from trl import RLOOTrainer
 import torch
+import numpy as np
+from trl.models.utils import disable_gradient_checkpointing
+from trl.trainer.utils import pad
+from trl.data_utils import (
+    is_conversational,
+)
+from accelerate.utils import gather, gather_object
 
 class CustomRLOO(RLOOTrainer):
     def __init__(
@@ -30,6 +37,186 @@ class CustomRLOO(RLOOTrainer):
             )
 
 
+    def _generate_and_score_completions(self, inputs):
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+
+        prompts = [x["prompt"] for x in inputs]
+
+
+        prompt_ids_list, completion_ids_list = self._generate(prompts)
+
+        # Convert lists of token IDs to padded tensors
+        prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+        prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
+        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+        completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+        completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+        completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+        completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+        if self.mask_truncated_completions:
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+
+        forward_kwargs = {}
+
+        # If token_type_ids are used, extend them with zeros for the completion part
+        if "token_type_ids" in forward_kwargs:
+            token_type_ids = forward_kwargs["token_type_ids"]
+            forward_kwargs["token_type_ids"] = torch.cat(
+                [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
+            )
+
+        # When gradient checkpointing is enabled with use_reentrant=True (default), calling the model inside a
+        # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
+        # Temporarily disable checkpointing to avoid this warning during inference.
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            # Compute the per-token log probabilities for the current model
+            old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                self.model,
+                prompt_completion_ids,
+                attention_mask,
+                logits_to_keep,
+                batch_size,
+                num_images=0,
+                **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+            )
+            old_logps = (old_per_token_logps * completion_mask).sum(1)  # mask out padding and tokens after EOS
+
+            # Compute the per-token log probabilities for the reference model
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        num_images=0,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            batch_size=batch_size,
+                            num_images=0,
+                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                        )
+            else:
+                ref_per_token_logps = None
+
+        # Decode
+        prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text, strict=True):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                if isinstance(bootstrap, list):  # for VLM, the format might be [{"type": "text", "text": "..."}]
+                    assert len(bootstrap) == 1 and bootstrap[0]["type"] == "text"
+                    bootstrap = bootstrap[0]["text"]
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
+        # important because rewards will be normalized per group, and completions are distributed. We will later slice
+        # rewards_per_func to extract each process's subset.
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+
+        # Apply weights to each reward function's output and sum
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+
+        # Apply reward clipping if specified
+        if self.reward_clip_range:
+            rewards = rewards.clamp(min=self.reward_clip_range[0], max=self.reward_clip_range[1])
+
+        # Include the KL penalty in the reward
+        if self.beta != 0.0:
+            per_token_kl = old_per_token_logps - ref_per_token_logps
+            # Apply sequence-level KL penalty to rewards (sum KL across tokens first, then apply to each sequence)
+            kl = (per_token_kl * completion_mask).sum(-1)
+            kl = gather(kl)  # rewards are gathered, so kl must be too
+            rewards = rewards - self.beta * kl
+
+        num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+        grouped_rewards = rewards.view(-1, num_generations)
+        mean_grouped_rewards = grouped_rewards.mean(dim=1)
+        if num_generations > 1:
+            std_rewards = grouped_rewards.std(dim=1)
+        else:  # this case doesn't occur during training, but could in eval when num_generations_eval=1
+            std_rewards = torch.zeros_like(mean_grouped_rewards)
+        is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+
+        # RLOO advantages computation
+        grouped_sum = grouped_rewards.sum(dim=1, keepdim=True)  # (num_prompts, 1)
+        if num_generations > 1:
+            baselines = (grouped_sum - grouped_rewards) / (num_generations - 1)  # (num_prompts, num_generations)
+            baselines = baselines.view(-1)  # Flatten back to match rewards shape
+            advantages = rewards - baselines
+        else:  # this case doesn't occur during training, but could in eval when num_generations_eval=1
+            advantages = torch.zeros_like(rewards)
+
+        # Normalize advantages
+        if self.normalize_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
+        advantages = advantages[process_slice]
+
+        # Calculate and log the mean KL divergence between current and reference model
+        if self.beta != 0.0:
+            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+
+        # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+            #std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+            #self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # Log prompt and completion texts
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        for i, name in enumerate(self.reward_func_names):
+            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+        self._logs["advantages"].extend(all_process_advantages.tolist())
+
+
+        output = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_logps": old_logps,
+            "advantages": advantages,
+        }
+        return output
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model

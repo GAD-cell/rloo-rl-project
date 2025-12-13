@@ -1,0 +1,71 @@
+A run pour accelerer: 
+pip install flash-attn --no-build-isolation --no-cache-dir
+
+Pour le RM il faut sentencepiece pour deberta:
+pip install sentencepiece
+
+
+SFT
+
+python sft.py \
+    --model_name "EleutherAI/pythia-1.4b-deduped" \
+    --output_dir "checkpoints/sft" \
+    --lr 2e-5 \
+    --epochs 2 \
+    --batch_size 64 \
+    --grad_accum 4 \
+    --bf16 \
+    --flash_attn
+
+RM
+
+python rm.py \
+    --rm_model "microsoft/deberta-v3-large" \
+    --sft_model "checkpoints/sft" \
+    --rm_out "checkpoints/rm" \
+    --rm_lr 1e-5 \
+    --bf16
+python rm.py \
+    --rm_model "microsoft/deberta-v3-large" \
+    --sft_model "checkpoints/sft" \
+    --rm_out "checkpoints/rm" \
+    --rm_lr 1e-5 \
+    --batch_size 16 \
+    --grad_accum 2 \
+    --bf16
+
+DPO
+
+
+python dpo.py \
+    --sft_model "checkpoints/sft" \
+    --reward_model_path "checkpoints/rm" \
+    --dpo_out "checkpoints/dpo" \
+    --dpo_lr 1e-6 \
+    --epochs 1 \
+    --grad_accum 16 \
+    --bf16
+
+RLOO
+
+python rl.py \
+    --alg rloo \
+    --sft_model "checkpoints/sft/checkpoint-456" \
+    --reward_model "checkpoints/rm/checkpoint-2902" \
+    --output_dir "checkpoints/rloo" \
+    --lr 1e-6 \
+    --k 2 \
+    --grad_accum 16 \
+    --bf16
+
+RAFT
+
+python rl.py \
+    --alg raft \
+    --sft_model "checkpoints/sft/checkpoint-456" \
+    --reward_model "checkpoints/rm/checkpoint-2902" \
+    --output_dir "checkpoints/raft" \
+    --lr 1e-6 \
+    --k 2 \
+    --grad_accum 16 \
+    --bf16

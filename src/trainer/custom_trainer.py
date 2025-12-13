@@ -164,10 +164,14 @@ class CustomRLOO(RLOOTrainer):
             std_rewards = torch.zeros_like(mean_grouped_rewards)
         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
 
+        alpha = old_per_token_logps.view(-1,num_generations,old_per_token_logps.size(-1)) # (num_prompts,num_generations,seq_len)
+        alpha = alpha.sum(dim=-1) # log-likelihood sequence wise 
+        alpha = torch.softmax(alpha, dim=1) # (num_prompts,num_generations)
+        
         # RLOO advantages computation
-        grouped_sum = grouped_rewards.sum(dim=1, keepdim=True)  # (num_prompts, 1)
+        grouped_sum = (alpha*grouped_rewards).sum(dim=1, keepdim=True)  # (num_prompts, 1)
         if num_generations > 1:
-            baselines = (grouped_sum - grouped_rewards) / (num_generations - 1)  # (num_prompts, num_generations)
+            baselines = (grouped_sum - (alpha*grouped_rewards)) / (num_generations - 1)  # (num_prompts, num_generations)
             baselines = baselines.view(-1)  # Flatten back to match rewards shape
             advantages = rewards - baselines
         else:  # this case doesn't occur during training, but could in eval when num_generations_eval=1

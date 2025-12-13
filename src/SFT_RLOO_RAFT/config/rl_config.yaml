@@ -1,0 +1,19 @@
+alg : rloo
+
+sft_model: nobodytries/Pythia_1.4B_TLDR_SFT
+reward_model: nobodytries/RM_Deberta_TLDR_preference
+output_dir: "./output"
+
+lr: 1.0e-06
+k: 2
+batch_size: 1
+grad_accum: 16
+bf16: false
+
+use_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: 
+  - query_key_value
+  - dense

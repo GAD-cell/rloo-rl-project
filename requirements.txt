@@ -4,3 +4,4 @@ datasets
 math-verify
 numpy
 accelerate
+wandb

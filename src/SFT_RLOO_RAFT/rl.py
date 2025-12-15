@@ -87,26 +87,27 @@ def run_rloo(config):
 
 
 def run_custom_rloo(config):
-    print(f"RLOO(k={config['k']})")
+    print(f"RLOO custom(k={config['k']})")
     dataset = load_tldr_preferences_for_trainer(pref_split="train")
     eval_ds = load_tldr_preferences_for_trainer(pref_split="validation")
-    tokenizer = AutoTokenizer.from_pretrained(config.sft_model)
+    print(config["sft_model"])
+    tokenizer = AutoTokenizer.from_pretrained(config["sft_model"])
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    ref_policy = AutoModelForCausalLM.from_pretrained(config.sft_model, torch_dtype=torch.bfloat16, device_map="auto")
+    ref_policy = AutoModelForCausalLM.from_pretrained(config["sft_model"], torch_dtype=torch.bfloat16, device_map="auto")
     ref_policy = prepare_model_with_lora(ref_policy,config)
-    
-    reward_fn, _ = get_reward_fn(config.reward_model, tokenizer, policy.device)
-    rm_callback = RewardEvalCallback(config.reward_model, eval_ds, tokenizer, policy.device)
 
-    config = RLOOConfig(
-        output_dir=config.output_dir,
-        num_generations=config.k,
-        per_device_train_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.grad_accum,
-        learning_rate=config.lr,
+    reward_fn, _ = get_reward_fn(config["reward_model"], tokenizer, ref_policy.device)
+    rm_callback = RewardEvalCallback(config["reward_model"], eval_ds, tokenizer, ref_policy.device)
+
+    config_rloo = RLOOConfig(
+        output_dir=config["output_dir"],
+        num_generations=config["k"],
+        per_device_train_batch_size=config["batch_size"],
+        gradient_accumulation_steps=config["grad_accum"],
+        learning_rate=config["lr"],
         lr_scheduler_type="constant_with_warmup",
         warmup_ratio=0.03,
-        bf16=config.bf16,
+        bf16=config["bf16"],
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=50,
@@ -116,7 +117,7 @@ def run_custom_rloo(config):
     trainer = CustomRLOO(
             model=ref_policy,                 
             reward_funcs=reward_fn,        
-            config=config,                   
+            config=config_rloo,                   
             train_dataset=dataset,
             eval_dataset=eval_ds,
             processing_class=tokenizer,   

@@ -113,7 +113,7 @@ def run_rloo(cfg):
         eval_steps=50,
         max_prompt_length=64,
         max_completion_length=32,
-        report_to="none",
+        report_to="wandb",
     )
 
     trainer = RLOOTrainer(

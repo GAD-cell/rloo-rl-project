@@ -1,7 +1,7 @@
 alg : rloo
 
-sft_model: src/models/sft_model
-reward_model: src/models/rm_model
+sft_model: "GAD-cell/sft_commongen"
+reward_model: GAD-cell/rm_commongen
 output_dir: "src/models/rl_model"
 
 dataset_name: "allenai/common_gen"

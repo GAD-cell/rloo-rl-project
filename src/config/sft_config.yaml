@@ -1,0 +1,17 @@
+model:
+  name: "EleutherAI/pythia-70m"
+  output_dir: "src/models/sft_model"
+
+dataset:
+  name: allenai/common_gen
+  max_length: 128
+
+training:
+  lr: 2e-5
+  bf16: true
+  batch_size: 32
+  epochs: 1
+  warmup_steps: 5
+  logging_steps: 5
+  weight_decay: 0.001
+  seed: 3407

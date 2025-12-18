@@ -1,0 +1,21 @@
+alg : rloo
+
+sft_model: src/models/sft_model
+reward_model: src/models/rm_model
+output_dir: "src/models/rl_model"
+
+dataset_name: "allenai/common_gen"
+
+lr: 1.0e-06
+k: 2
+batch_size: 16
+grad_accum: 2
+bf16: false
+
+use_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: 
+  - query_key_value
+  - dense

@@ -68,7 +68,7 @@ def run_rloo(cfg):
         device_map="auto",
     )
     reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
-    
+
     def prepare_dataset(split):
         ds = load_dataset("allenai/common_gen", split=split)
         def format_fn(ex):
@@ -135,44 +135,94 @@ def run_rloo(cfg):
     trainer.save_model(cfg["output_dir"])
 
 
-def run_custom_rloo(config):
-    print(f"RLOO custom(k={config['k']})")
-    dataset = load_tldr_preferences_for_trainer(pref_split="train")
-    eval_ds = load_tldr_preferences_for_trainer(pref_split="validation")
-    print(config["sft_model"])
-    tokenizer = AutoTokenizer.from_pretrained(config["sft_model"])
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    ref_policy = AutoModelForCausalLM.from_pretrained(config["sft_model"], torch_dtype=torch.bfloat16, device_map="auto")
+def run_custom_rloo(cfg):
+    model_path = cfg["sft_model"]
 
-    reward_fn, _ = get_reward_fn(config["reward_model"], tokenizer, ref_policy.device)
-    rm_callback = RewardEvalCallback(config["reward_model"], eval_ds, tokenizer, ref_policy.device)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    # En RL, le padding à gauche est obligatoire pour la génération
+    tokenizer.padding_side = "left"
+    
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=torch.float32, 
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+    
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        cfg["reward_model"],
+        num_labels=1,
+        dtype=torch.float32,
+        device_map="auto",
+    )
+    reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
+    
+    def prepare_dataset(split):
+        ds = load_dataset("allenai/common_gen", split=split)
+        def format_fn(ex):
+            return {"prompt": f"Concepts: {', '.join(ex['concepts'])}\nSentence: "}
+        return ds.map(format_fn, remove_columns=ds.column_names)
+
+    train_dataset = prepare_dataset("train")
+    eval_dataset = prepare_dataset("validation")
+
+
+
+    def custom_reward_function(prompts, completions, **kwargs):
+        inputs = reward_tokenizer(
+            completions, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=64
+        ).to(reward_model.device)
+        
+        with torch.no_grad():
+            reward_outputs = reward_model(**inputs)
+            rewards = reward_outputs.logits.squeeze(-1)
+
+        empty_penalty = torch.tensor([
+        -2.0 if len(c.strip()) == 0 else  
+        -1.0 if len(c.strip().split()) < 3 else 
+        0.0 
+        for c in completions
+        ], device=rewards.device) 
+        
+        final_rewards = rewards + empty_penalty
+        return final_rewards
+
 
     config_rloo = RLOOConfig(
-        output_dir=config["output_dir"],
-        num_generations=config["k"],
-        per_device_train_batch_size=config["batch_size"],
-        gradient_accumulation_steps=config["grad_accum"],
-        learning_rate=config["lr"],
-        lr_scheduler_type="constant_with_warmup",
-        warmup_ratio=0.03,
-        bf16=config["bf16"],
+        output_dir=cfg["output_dir"],
+        num_generations=cfg["k"],
+        max_grad_norm=1.0,
+        per_device_train_batch_size=cfg["batch_size"],
+        gradient_accumulation_steps=cfg["grad_accum"],
+        learning_rate=float(cfg["lr"]),
+        bf16=cfg["bf16"],
+        fp16=False,
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=50,
-        max_prompt_length=256,
-        report_to="none"
+        max_prompt_length=64,
+        max_completion_length=32,
+        report_to="wandb",
     )
+
     trainer = CustomRLOO(
-            model=ref_policy,                 
-            reward_funcs=reward_fn,        
-            config=config_rloo,                   
-            train_dataset=dataset,
-            eval_dataset=eval_ds,
-            processing_class=tokenizer,   
-            callbacks=[rm_callback]
-        )    
+        model=policy_model,
+        reward_funcs=custom_reward_function,
+        args=config_rloo,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+    )
+
     trainer.train()
-    trainer.save_model(config.output_dir)
+    
+    trainer.save_model(cfg["output_dir"])
 
 def run_raft(config):
     print(f"RAFT(k={config.k})")

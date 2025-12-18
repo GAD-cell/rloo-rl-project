@@ -5,6 +5,7 @@ import sys
 import os 
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+os.environ["WANDB_PROJECT"] = "rloo-commongen"
 
 from huggingface_hub import login
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification

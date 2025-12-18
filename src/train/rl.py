@@ -53,7 +53,7 @@ def run_rloo(cfg):
         tokenizer.pad_token = tokenizer.eos_token
     # En RL, le padding à gauche est obligatoire pour la génération
     tokenizer.padding_side = "left"
-
+    
     policy_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         dtype=torch.float32, 
@@ -67,7 +67,8 @@ def run_rloo(cfg):
         dtype=torch.float32,
         device_map="auto",
     )
-
+    reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
+    
     def prepare_dataset(split):
         ds = load_dataset("allenai/common_gen", split=split)
         def format_fn(ex):
@@ -80,22 +81,26 @@ def run_rloo(cfg):
 
 
     def custom_reward_function(prompts, completions, **kwargs):
-        texts = [p + c for p, c in zip(prompts, completions)]
-        
-        inputs = tokenizer(
-            texts, 
+        inputs = reward_tokenizer(
+            completions, 
             return_tensors="pt", 
             padding=True, 
             truncation=True, 
-            max_length=512
+            max_length=64
         ).to(reward_model.device)
         
         with torch.no_grad():
             reward_outputs = reward_model(**inputs)
-            rewards = reward_outputs.logits.squeeze(-1) 
+            rewards = reward_outputs.logits.squeeze(-1)
 
-        final_rewards = rewards 
+        empty_penalty = torch.tensor([
+        -2.0 if len(c.strip()) == 0 else  
+        -1.0 if len(c.strip().split()) < 3 else 
+        0.0 
+        for c in completions
+        ], device=rewards.device) 
         
+        final_rewards = rewards + empty_penalty
         return final_rewards
 
 

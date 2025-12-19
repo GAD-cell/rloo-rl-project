@@ -6,11 +6,15 @@ RM_DATA_SCRIPT := src/data/rm_dataset.py
 RM_TRAIN_SCRIPT := src/train/rm.py
 SFT_TRAIN_SCRIPT := src/train/sft.py
 RL_TRAIN_SCRIPT := src/train/rl.py
+SFT_GSM8K_TRAIN_SCRIPT := src/train/sft_gsm8k.py
+RL_GSM8K_TRAIN_SCRIPT := src/train/rl_gsm8k.py
 CONFIG_FILE_RM := src/config/rm_config.yaml
 CONFIG_FILE_SFT := src/config/sft_config.yaml
 CONFIG_FILE_RL := src/config/rl_config.yaml
+CONFIG_FILE_SFT_GSM8K := src/config/sft_gsm8k_config.yaml
+CONFIG_FILE_RL_GSM8K := src/config/rl_gsm8k_config.yaml
 
-.PHONY: env rm_data train_rm train_sft train_rl clean
+.PHONY: env rm_data train_rm train_sft train_sft_gsm8k train_rl train_rl_gsm8k clean
 
 env:
 	@command -v uv >/dev/null 2>&1 || { \
@@ -37,10 +41,20 @@ train_sft:
 	@$(PYTHON) $(SFT_TRAIN_SCRIPT) --config $(CONFIG_FILE_SFT)
 	@echo "Training finished. Model saved in ./models/sft_model"
 
+train_sft_gsm8k:
+	@echo "Starting GSM8K SFT Training with config $(CONFIG_FILE_SFT_GSM8K)..."
+	@$(PYTHON) $(SFT_GSM8K_TRAIN_SCRIPT) --config $(CONFIG_FILE_SFT_GSM8K)
+	@echo "Training finished. Model saved to output_dir set in $(CONFIG_FILE_SFT_GSM8K)"
+
 train_rl:
 	@echo "Starting RL Training with config $(CONFIG_FILE_RL)..."
 	@$(PYTHON) $(RL_TRAIN_SCRIPT) --config $(CONFIG_FILE_RL)
 	@echo "Training finished. Model saved in ./models/rl_model"
+
+train_rl_gsm8k:
+	@echo "Starting GSM8K RL Training with config $(CONFIG_FILE_RL_GSM8K)..."
+	@$(PYTHON) $(RL_GSM8K_TRAIN_SCRIPT) --config $(CONFIG_FILE_RL_GSM8K)
+	@echo "Training finished. Model saved to output_dir set in $(CONFIG_FILE_RL_GSM8K)"
 
 clean:
 	@echo "Cleaning up..."

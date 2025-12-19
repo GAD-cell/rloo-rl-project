@@ -1,0 +1,17 @@
+model:
+  name: "EleutherAI/pythia-410m"
+  output_dir: "src/models/sft_gsm8k"
+
+dataset:
+  name: "gsm8k"
+  subset: "main"
+
+training:
+  lr: 2e-5
+  bf16: false
+  batch_size: 4
+  epochs: 1
+  warmup_steps: 50
+  logging_steps: 10
+  weight_decay: 0.0
+  seed: 3407

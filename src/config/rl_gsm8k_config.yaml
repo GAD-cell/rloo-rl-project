@@ -1,0 +1,9 @@
+sft_model: "src/models/sft_gsm8k"
+output_dir: "src/models/rl_gsm8k"
+
+lr: 1.0e-06
+k: 4
+batch_size: 2
+grad_accum: 8
+bf16: false
+fp16: true

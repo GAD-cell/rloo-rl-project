@@ -1,4 +1,4 @@
-alg : rloo
+alg : ppo
 
 sft_model: "GAD-cell/sft_commongen"
 reward_model: GAD-cell/rm_commongen

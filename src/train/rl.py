@@ -44,6 +44,50 @@ def prepare_model_with_lora(model, config):
     return model
 '''
 
+from trl import AutoModelForCausalLMWithValueHead
+from transformers import pipeline
+
+import torch
+import torch.nn as nn
+
+class RewardModelWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.config = model.config
+        self.base_model_prefix = getattr(model, 'base_model_prefix', 'model')
+        self.name_or_path = getattr(model, 'name_or_path', '')
+        
+    def score(self, hidden_states):
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)  
+        
+        if hasattr(self.model, 'classifier'):
+            scores = self.model.classifier(hidden_states)
+            if scores.dim() == 3:
+                scores = scores[:, 0, :] 
+        elif hasattr(self.model, 'score'):
+            scores = self.model.score(hidden_states)
+            if scores.dim() == 1:
+                scores = scores.unsqueeze(-1)  # (batch_size,) -> (batch_size, 1)
+        else:
+            raise AttributeError("Reward model has neither 'classifier' nor 'score' attribute")
+        
+        if scores.dim() == 1:
+            scores = scores.unsqueeze(-1)
+            
+        return scores  # Retourne (batch_size, 1)
+    
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        """Forward tous les autres attributs au modèle wrappé"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
 def run_ppo(cfg):
     model_path = cfg["sft_model"]
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -51,30 +95,48 @@ def run_ppo(cfg):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     
-    policy_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+    policy_model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float32,
         device_map="auto",
         low_cpu_mem_usage=True,
     )
-    
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        cfg["reward_model"],
+
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+
+    value_model = AutoModelForSequenceClassification.from_pretrained(
+        cfg.get("value_model", model_path),
         num_labels=1,
         torch_dtype=torch.float32,
         device_map="auto",
     )
-    reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
-    if reward_tokenizer.pad_token is None:
-        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+
+    base_reward_model = AutoModelForSequenceClassification.from_pretrained(
+        cfg["reward_model"],
+        num_labels=1,
+        torch_dtype=torch.float32,
+        device_map="auto",
+        output_hidden_states=True,
+    )
+    reward_model = RewardModelWrapper(base_reward_model)
     
     def prepare_dataset(split):
         ds = load_dataset("allenai/common_gen", split=split)
         def format_fn(ex):
             prompt = f"Concepts: {', '.join(ex['concepts'])}\nSentence: "
+            encoded = tokenizer(
+                prompt,
+                truncation=True,
+                max_length=cfg.get("max_prompt_length", 512),
+            )
             return {
-                "query": prompt,
-                "input_ids": tokenizer.encode(prompt, return_tensors="pt")[0]
+                "input_ids": encoded["input_ids"],
+                "attention_mask": encoded["attention_mask"],
             }
         return ds.map(format_fn, remove_columns=ds.column_names)
     
@@ -82,29 +144,35 @@ def run_ppo(cfg):
     eval_dataset = prepare_dataset("validation")
     
     config_ppo = PPOConfig(
-        model_name=model_path,
-        reward_model=reward_model,
         learning_rate=cfg.get("learning_rate", 1.41e-5),
-        batch_size=cfg.get("batch_size", 16),
+        per_device_train_batch_size=cfg.get("batch_size", 16),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
         max_grad_norm=cfg.get("max_grad_norm", 1.0),
-        seed=cfg.get("seed", 42),
-        tracker_project_name=cfg.get("tracker_project_name", "ppo-common-gen"),
-        remove_unused_columns=False,
+        num_ppo_epochs=cfg.get("num_ppo_epochs", 4),
+        num_mini_batches=cfg.get("num_mini_batches", 1),
+        total_episodes=cfg.get("total_episodes", 10000),
+        local_rollout_forward_batch_size=cfg.get("local_rollout_forward_batch_size", 16),
+        response_length=cfg.get("response_length", 128),
+        temperature=cfg.get("temperature", 1.0),
+        missing_eos_penalty=cfg.get("missing_eos_penalty", None),
     )
     
     trainer = PPOTrainer(
-        config=config_ppo,
+        args=config_ppo,
+        processing_class=tokenizer,
         model=policy_model,
-        tokenizer=tokenizer,
-        dataset=train_dataset,
+        ref_model=ref_model,
+        reward_model=reward_model,
+        value_model=value_model,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
     )
     
     trainer.train()
     
     trainer.save_model(cfg["output_dir"])
+    tokenizer.save_pretrained(cfg["output_dir"])
     print(f"Modèle sauvegardé dans {cfg['output_dir']}")
-
 
 def run_rloo(cfg):
     model_path = cfg["sft_model"]
@@ -112,7 +180,6 @@ def run_rloo(cfg):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # En RL, le padding à gauche est obligatoire pour la génération
     tokenizer.padding_side = "left"
     
     policy_model = AutoModelForCausalLM.from_pretrained(

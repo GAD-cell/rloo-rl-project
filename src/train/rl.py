@@ -9,7 +9,7 @@ os.environ["WANDB_PROJECT"] = "rloo-commongen"
 
 from huggingface_hub import login
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
-from trl import RLOOTrainer, RLOOConfig, SFTTrainer, SFTConfig
+from trl import RLOOTrainer, RLOOConfig, SFTTrainer, SFTConfig, PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
 from datasets import Dataset
 #from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trainer.custom_trainer import CustomRLOO
@@ -44,6 +44,66 @@ def prepare_model_with_lora(model, config):
     return model
 '''
 
+def run_ppo(cfg):
+    model_path = cfg["sft_model"]
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    
+    policy_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+    
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        cfg["reward_model"],
+        num_labels=1,
+        torch_dtype=torch.float32,
+        device_map="auto",
+    )
+    reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
+    if reward_tokenizer.pad_token is None:
+        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+    
+    def prepare_dataset(split):
+        ds = load_dataset("allenai/common_gen", split=split)
+        def format_fn(ex):
+            prompt = f"Concepts: {', '.join(ex['concepts'])}\nSentence: "
+            return {
+                "query": prompt,
+                "input_ids": tokenizer.encode(prompt, return_tensors="pt")[0]
+            }
+        return ds.map(format_fn, remove_columns=ds.column_names)
+    
+    train_dataset = prepare_dataset("train")
+    eval_dataset = prepare_dataset("validation")
+    
+    config_ppo = PPOConfig(
+        model_name=model_path,
+        reward_model=reward_model,
+        learning_rate=cfg.get("learning_rate", 1.41e-5),
+        batch_size=cfg.get("batch_size", 16),
+        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
+        max_grad_norm=cfg.get("max_grad_norm", 1.0),
+        seed=cfg.get("seed", 42),
+        tracker_project_name=cfg.get("tracker_project_name", "ppo-common-gen"),
+        remove_unused_columns=False,
+    )
+    
+    trainer = PPOTrainer(
+        config=config_ppo,
+        model=policy_model,
+        tokenizer=tokenizer,
+        dataset=train_dataset,
+    )
+    
+    trainer.train()
+    
+    trainer.save_model(cfg["output_dir"])
+    print(f"Modèle sauvegardé dans {cfg['output_dir']}")
 
 
 def run_rloo(cfg):
@@ -294,4 +354,5 @@ if __name__ == "__main__":
 
     if config["alg"] == "rloo": run_rloo(config)
     elif config["alg"] == "custom-rloo": run_custom_rloo(config)
+    elif config["alg"] == "ppo": run_ppo(config)
     else: run_raft(config)

@@ -1,5 +1,4 @@
 torch
-trl
 transformers
 datasets
 numpy
@@ -7,3 +6,4 @@ accelerate
 wandb
 peft
 bitsandbytes
+trl

@@ -1,7 +1,7 @@
 alg : ppo
 
 sft_model: "GAD-cell/sft_commongen"
-reward_model: GAD-cell/rm_commongen
+reward_model: EleutherAI/pythia-70m
 output_dir: "src/models/rl_model"
 
 dataset_name: "allenai/common_gen"

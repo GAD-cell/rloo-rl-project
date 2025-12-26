@@ -54,6 +54,7 @@ def train_rm(cfg):
         save_strategy="no",
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         remove_unused_columns=False,
+        center_rewards_coefficient=0.1
     )
 
     trainer = RewardTrainer(

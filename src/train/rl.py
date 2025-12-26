@@ -31,22 +31,6 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
     
-'''
-def prepare_model_with_lora(model, config):
-    if config["use_lora"]:
-        lora_config = LoraConfig(
-        r=config.get('r', 16),
-        lora_alpha=config.get('alpha', 32),
-        target_modules=config.get('target_modules', ["q_proj", "v_proj", "k_proj", "o_proj"]),
-        lora_dropout=config.get('dropout', 0.05),
-        bias="none",
-        task_type="CAUSAL_LM")
-
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-    return model
-'''
-
 def run_ppo(cfg):
     model_path = cfg["sft_model"]
     reward_model_path = cfg["reward_model"]
@@ -64,9 +48,21 @@ def run_ppo(cfg):
         model_path, 
         **model_kwargs
     )
+    from transformers import GenerationConfig
 
+    '''
+    gen_cfg = GenerationConfig(
+        min_new_tokens=10,
+        max_new_tokens=16,
+        temperature = 1.0,
+        do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    policy.generation_config = gen_cfg
+    '''
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        model_path,
+        reward_model_path,
         num_labels=1,
         **model_kwargs
     )
@@ -76,6 +72,28 @@ def run_ppo(cfg):
         num_labels=1,
         **model_kwargs,
     )
+    original_rm_forward = reward_model.forward
+    def safe_forward(self, input_ids=None, attention_mask=None, **kwargs):
+        if input_ids is not None and input_ids.shape[1] == 0:
+            device = input_ids.device
+            input_ids = torch.full((input_ids.shape[0], 1), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            if attention_mask is not None:
+                attention_mask = torch.ones((input_ids.shape[0], 1), dtype=torch.long, device=device)
+        
+        return original_rm_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    
+    original_value_forward = value_model.forward
+    def safe_forward_value(self, input_ids=None, attention_mask=None, **kwargs):
+        if input_ids is not None and input_ids.shape[1] == 0:
+            device = input_ids.device
+            input_ids = torch.full((input_ids.shape[0], 1), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            if attention_mask is not None:
+                attention_mask = torch.ones((input_ids.shape[0], 1), dtype=torch.long, device=device)
+    
+        return original_value_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    from types import MethodType
+    reward_model.forward = MethodType(safe_forward, reward_model)
+    value_model.forward = MethodType(safe_forward_value, value_model)
 
     def prepare_dataset(split):
         ds = load_dataset("allenai/common_gen", split=split)
@@ -84,7 +102,7 @@ def run_ppo(cfg):
             tokenized = tokenizer(
                 prompt_text, 
                 truncation=True, 
-                max_length=512,
+                max_length=64,
                 padding=False 
             )
             return {
@@ -101,9 +119,11 @@ def run_ppo(cfg):
     validation_dataset = prepare_dataset("validation")
 
     config_ppo = PPOConfig(
-        learning_rate=cfg.get("learning_rate", 1.41e-5),
+        learning_rate=cfg.get("lr", 1.41e-5),
+        temperature=1.0,
+        response_length=16,
         batch_size=cfg.get("batch_size", 16),
-        mini_batch_size=cfg.get("mini_batch_size", 4),
+        mini_batch_size=cfg.get("mini_batch_size", 16),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
         eval_steps=1000
     )
@@ -144,7 +164,9 @@ def run_rloo(cfg):
         device_map="auto",
     )
     reward_tokenizer = AutoTokenizer.from_pretrained(cfg["reward_model"])
-
+    if reward_tokenizer.pad_token is None:
+        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+    
     def prepare_dataset(split):
         ds = load_dataset("allenai/common_gen", split=split)
         def format_fn(ex):
@@ -157,8 +179,10 @@ def run_rloo(cfg):
 
 
     def custom_reward_function(prompts, completions, **kwargs):
+        cleaned_completions = [c if len(c.strip()) > 0 else " " for c in completions]
+        
         inputs = reward_tokenizer(
-            completions, 
+            cleaned_completions, 
             return_tensors="pt", 
             padding=True, 
             truncation=True, 
@@ -169,15 +193,18 @@ def run_rloo(cfg):
             reward_outputs = reward_model(**inputs)
             rewards = reward_outputs.logits.squeeze(-1)
 
-        empty_penalty = torch.tensor([
-        -2.0 if len(c.strip()) == 0 else  
-        -1.0 if len(c.strip().split()) < 3 else 
-        0.0 
-        for c in completions
-        ], device=rewards.device) 
+        penalties = []
+        for c in completions:
+            stripped = c.strip()
+            if len(stripped) == 0:
+                penalties.append(-2.0)
+            elif len(stripped.split()) < 3:
+                penalties.append(-1.0)
+            else:
+                penalties.append(0.0)
         
-        final_rewards = rewards + empty_penalty
-        return final_rewards
+        #penalty_tensor = torch.tensor(penalties, device=rewards.device)
+        return rewards #+ penalty_tensor
 
 
     config_rloo = RLOOConfig(
@@ -191,7 +218,7 @@ def run_rloo(cfg):
         fp16=False,
         logging_steps=10,
         eval_strategy="steps",
-        eval_steps=50,
+        eval_steps=500,
         max_prompt_length=64,
         max_completion_length=32,
         report_to="wandb",
@@ -266,7 +293,7 @@ def run_custom_rloo(cfg):
         for c in completions
         ], device=rewards.device) 
         
-        final_rewards = rewards + empty_penalty
+        final_rewards = rewards #+ empty_penalty
         return final_rewards
 
 

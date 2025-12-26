@@ -14,7 +14,7 @@ def get_distractor_concept(current_concepts):
         distractor = random.choice(all_concepts)
     return distractor
 
-def complex_negative_generator(example, p_shuffle=0.3, p_drop=0.3, p_insert_vocab=0.4, p_insert_distractor=0.2):
+def complex_negative_generator(example, p_shuffle=0.3, p_drop=0.3, p_insert_vocab=0.4, p_insert_distractor=0.2, p_empty=0.1):
     concepts = example['concepts']
     prompt = ", ".join(concepts)
     positive = example['target']
@@ -32,8 +32,11 @@ def complex_negative_generator(example, p_shuffle=0.3, p_drop=0.3, p_insert_voca
     
     if random.random() < p_shuffle:
         random.shuffle(words)
-        
-    negative = " ".join(words)
+    
+    if random.random() < p_empty:
+        negative = " "
+    else: 
+        negative = " ".join(words)
     
     if negative == positive:
         random.shuffle(words)
